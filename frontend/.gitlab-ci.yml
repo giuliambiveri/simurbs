@@ -1,0 +1,99 @@
+image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/node:18
+
+variables:
+  SSH_HOST: "gitlab-cd@mamis.sa4.si.usi.ch"
+  DOCKER_STAGING_HOST: "mamis.sa4.si.usi.ch"
+  CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX_SLASH: ${FROM ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/
+  VUE_APP_BASE_URL: https://mamis.sa4.si.usi.ch/backend/
+
+stages:
+  - install
+  - build
+  - release
+  - deploy
+
+cache:
+  paths:
+    - ./node_modules/
+
+install_dependencies:
+  stage: install
+  script:
+    - yarn install
+  artifacts:
+    expire_in: 2 hours
+    paths:
+      - ./node_modules/
+
+build:
+  stage: build
+  script:
+    - echo VUE_APP_BASE_URL=${VUE_APP_BASE_URL} >> .env.production
+    - yarn build
+  artifacts:
+    expire_in: 2 hours
+    paths:
+      - ./dist/
+
+release_frontend:
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+  stage: release
+  services:
+    - name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-dind
+      alias: docker
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-git
+  script:
+    - echo "Logging in to Gitlab Container registry with CI credentials..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+
+deploy_frontend:
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+  stage: deploy
+  tags:
+    - ci-dev-runner
+  services:
+    - name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:23-dind
+      alias: docker
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:23-git
+  variables:
+    FRONTEND_IMAGE: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}
+  environment:
+    name: staging
+    url: https://mamis.sa4.si.usi.ch
+  script:
+    - echo "Logging in to Gitlab Container registry with CI credentials..."
+    - unset DOCKER_HOST
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - setup_ssh_docker_host
+    - unset DOCKER_HOST
+    - docker context create --docker "host=ssh://$SSH_HOST" remote
+    - docker context use remote
+    - docker info
+    - cd deployment
+    - docker --context remote compose -f docker-compose.yml down
+    - docker --context remote compose -f docker-compose.yml pull
+    - docker --context remote compose -f docker-compose.yml up -d
+
+.devops: &devops |
+  function setup_ssh_docker_host() {
+    echo "Setting up ssh agent proxy..."
+    apk add openssh-client
+  
+    # Run ssh-agent (inside the build environment)
+    eval $(ssh-agent -s)
+  
+    mkdir -p ~/.ssh
+  
+    echo "$DOCKER_CD_KEY_2024_MM_ENC" | base64 -d > ~/.ssh/id_rsa
+    chmod 600 ~/.ssh/id_rsa
+  
+    ssh-keyscan -H "$DOCKER_STAGING_HOST" >>~/.ssh/known_hosts
+    ssh-add ~/.ssh/id_rsa
+  }
+
+before_script:
+  - *devops
