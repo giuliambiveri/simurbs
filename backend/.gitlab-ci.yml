@@ -1,0 +1,201 @@
+# This is the CI file to be tested with the sample repo, show compile, build, and documentation generation with javadoc
+image: gradle:jdk21
+
+# Disable the Gradle daemon for Continuous Integration servers as correctness
+# is usually a priority over speed in CI environments. Using a fresh
+# runtime for each build is more reliable since the runtime is completely
+# isolated from any previous builds.
+variables:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX_SLASH: ${FROM ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/
+  SONARQUBE_PROJECT_KEY: ${CI_PROJECT_ID}:${CI_COMMIT_REF_SLUG}
+  SONARQUBE_PROJECT_NAME: sa4/2024/team4-mamis/backend:${CI_COMMIT_REF_SLUG}
+  SONARQUBE_GROUP_ID: AY8FGuC3bcXSaHk6fbDo
+  SSH_HOST: "gitlab-cd@mamis.sa4.si.usi.ch"
+  DOCKER_STAGING_HOST: "mamis.sa4.si.usi.ch"
+  SIMURBS_BACKEND_BASE_URL: "https://mamis.sa4.si.usi.ch/backend/"
+  SIMURBS_FRONTEND_BASE_URL: "https://mamis.sa4.si.usi.ch"
+
+stages:
+  - build
+  - test
+  - quality
+  - assemble
+  - release
+  - deploy
+
+compile_job:
+  stage: build
+  script: gradle compileJava
+  artifacts:
+    when: always
+    paths:
+      - build/classes
+    expire_in: 1 hour
+
+javadoc_job:
+  stage: build
+  script: gradle javadoc
+  artifacts:
+    when: always
+    paths:
+      - build/docs
+    expire_in: 1 hour
+
+test_job:
+  stage: test
+  script: gradle test
+  cache:
+    key: "$CI_COMMIT_REF_NAME"
+    policy: pull
+    paths:
+      - build
+      - .gradle
+  artifacts:
+    when: always
+    paths:
+      - build/reports/jacoco/test/*
+      - build/reports/tests/*
+      - build/test-results/test/TEST-*
+      - build/classes
+    reports:
+      junit: [ build/reports/jacoco/test/jacocoTestReport.xml, build/test-results/test/**/TEST-*.xml ]
+    expire_in: 1 hour
+  dependencies:
+    - compile_job
+
+.sonarqube-check:
+  stage: quality
+  image:
+    name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/sonarsource/sonar-scanner-cli:5.0.1
+    entrypoint: [ '' ]
+  variables:
+    SONAR_USER_HOME: '${CI_PROJECT_DIR}/.sonar' # Defines the location of the analysis task cache
+    GIT_DEPTH: '0' # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: '${CI_JOB_NAME}'
+    paths:
+      - .sonar/cache
+
+# This sonarqube job can be manually run on feature branches.
+# It is allowed to fail.
+sonarqube-check-branch:
+  tags:
+    - ci-dev-runner
+  extends: .sonarqube-check
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_COMMIT_BRANCH != "main")
+  when: manual
+  allow_failure: true
+  script:
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/projects/create?name=${SONARQUBE_PROJECT_NAME}&project=${SONARQUBE_PROJECT_KEY}\" || echo Project already exists"
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/permissions/add_group?projectKey=${SONARQUBE_PROJECT_KEY}&groupId=${SONARQUBE_GROUP_ID}&permission=user\" || echo Project permission already set or has error"
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/permissions/add_group?projectKey=${SONARQUBE_PROJECT_KEY}&groupId=${SONARQUBE_GROUP_ID}&permission=codeviewer\" || echo Project permission already set or has error"
+    - sonar-scanner
+
+## This sonarqube job is run on main and dev, and it's automatic.
+## Moreover, it is *not* allowed to fail - if the Quality Gate fails,
+## the pipeline fails.
+sonarqube-check:
+  extends: .sonarqube-check
+  tags:
+    - ci-dev-runner
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_BRANCH == "main")
+  allow_failure: false
+  script:
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/projects/create?name=${SONARQUBE_PROJECT_NAME}&project=${SONARQUBE_PROJECT_KEY}\" || echo Project already exists"
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/permissions/add_group?projectKey=${SONARQUBE_PROJECT_KEY}&groupId=${SONARQUBE_GROUP_ID}&permission=user\" || echo Project permission already set or has error"
+    - "curl -u ${SONAR_TOKEN}: -X POST \"https://lab.si.usi.ch/sonarqube/api/permissions/add_group?projectKey=${SONARQUBE_PROJECT_KEY}&groupId=${SONARQUBE_GROUP_ID}&permission=codeviewer\" || echo Project permission already set or has error"
+    - sonar-scanner
+
+
+# Creates the jar file for the Docker image
+assemble_jar:
+  stage: assemble
+  script:
+    - echo "Assembling the jar..."
+    - gradle assemble
+  artifacts:
+    when: always
+    paths:
+      - build/libs
+    expire_in: 1 hour
+
+release_backend:
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+  stage: release
+  services:
+    - name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-dind
+      alias: docker
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-git
+  script:
+    - echo "Logging in to Gitlab Container registry with CI credentials..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+
+deploy_backend:
+  rules:
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+  stage: deploy
+  tags:
+    - ci-dev-runner
+  services:
+    - name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-dind
+      alias: docker
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:25-git
+  variables:
+    BACKEND_IMAGE: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}
+  environment:
+    name: staging
+    url: https://mamis.sa4.si.usi.ch/backend/
+  script:
+    - echo "Logging in to Gitlab Container registry with CI credentials..."
+    - unset DOCKER_HOST
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - setup_ssh_docker_host
+    - unset DOCKER_HOST
+    - docker context create --docker "host=ssh://$SSH_HOST" remote
+    - docker context use remote
+    - docker info
+    - cd deployment
+    - docker --context remote compose -f docker-compose.yml down
+    - docker --context remote compose -f docker-compose.yml pull
+    - docker --context remote compose -f docker-compose.yml up -d
+
+
+.devops: &devops |
+  function setup_ssh_docker_host() {
+    echo "Setting up ssh agent proxy..."
+    apk add openssh-client
+  
+    # Run ssh-agent (inside the build environment)
+    eval $(ssh-agent -s)
+  
+    mkdir -p ~/.ssh
+  
+    echo "$DOCKER_CD_KEY_2024_MM_ENC" | base64 -d > ~/.ssh/id_rsa
+    chmod 600 ~/.ssh/id_rsa
+  
+    ssh-keyscan -H "$DOCKER_STAGING_HOST" >>~/.ssh/known_hosts
+    ssh-add ~/.ssh/id_rsa
+  }
+
+
+
+# Deploy javadoc documentation in the public folder on GitLab
+pages:
+  stage: deploy
+  script:
+    - mv build/docs/javadoc public
+  artifacts:
+    paths:
+      - public
+  only:
+    - dev
+
+before_script:
+  - export GRADLE_USER_HOME=`pwd`/.gradle
+  - *devops

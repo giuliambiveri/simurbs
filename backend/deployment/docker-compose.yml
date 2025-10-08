@@ -1,0 +1,25 @@
+version: '3.5'
+
+services:
+  mongodb:
+    image: mongo:6
+    networks: [ mamis-network ]
+    restart: always
+
+  backend:
+    image: ${BACKEND_IMAGE}
+    container_name: mamis-backend
+    networks: [ mamis-network ]
+    depends_on:
+      - mongodb
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - SIMURBS_FRONTEND_BASE_URL=${SIMURBS_FRONTEND_BASE_URL}
+      - SIMURBS_BACKEND_BASE_URL=${SIMURBS_BACKEND_BASE_URL}
+
+
+networks:
+  mamis-network:
+    external: true
+    name: mamis-network
+
